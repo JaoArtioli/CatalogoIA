@@ -1,0 +1,216 @@
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Path
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+from uuid import UUID
+
+from app.core.database import get_db
+
+router = APIRouter()
+
+def parse_image_urls(image_urls_string):
+    """Converte string de URLs separadas por vírgula em array de objetos"""
+    if not image_urls_string or image_urls_string.strip() == '':
+        return []
+    
+    urls = [url.strip() for url in image_urls_string.split(',') if url.strip()]
+    return [{"url": url} for url in urls]
+
+def parse_original_codes(original_codes_string):
+    """Converte string de códigos separados por ' / ' em array de objetos"""
+    if not original_codes_string or original_codes_string.strip() == '':
+        return []
+    
+    codes = [code.strip() for code in original_codes_string.split(' / ') if code.strip()]
+    return [{"code": code, "type": "OEM"} for code in codes]
+
+@router.get("/")
+async def get_products(
+    skip: int = 0,
+    limit: int = 20,
+    brand_id: Optional[str] = None,
+    category_id: Optional[str] = None,
+    active_only: bool = True,
+    db: Session = Depends(get_db)
+):
+    """Lista produtos do banco real PostgreSQL"""
+    try:
+        # Query SQL incluindo original_codes e image_urls
+        query = text("""
+            SELECT id, sku, title, description, brand, category, original_codes, image_urls
+            FROM products 
+            ORDER BY id 
+            LIMIT :limit OFFSET :offset
+        """)
+        
+        result = db.execute(query, {"limit": limit, "offset": skip})
+        products = []
+        
+        for row in result:
+            product = {
+                "id": str(row.id),
+                "sku": row.sku,
+                "title": row.title,
+                "description": row.description,
+                "brand": {"name": row.brand} if row.brand else None,
+                "category": row.category,
+                "original_codes": row.original_codes,  # Campo original_codes como string
+                "images": parse_image_urls(row.image_urls),  # Converte image_urls para array
+                "codes": parse_original_codes(row.original_codes)  # Códigos como array para compatibilidade
+            }
+            products.append(product)
+        
+        return products
+        
+    except Exception as e:
+        print(f"Erro ao buscar produtos: {e}")
+        # Fallback para dados mock em caso de erro
+        return [
+            {
+                "id": "123e4567-e89b-12d3-a456-426614174000",
+                "sku": "ALT001",
+                "title": "Alternador 12V 90A",
+                "description": "Alternador para veículos nacionais",
+                "brand": {"name": "LOG"},
+                "original_codes": "HY 1534017 / YA 580039672",
+                "images": [],
+                "codes": [{"code": "HY 1534017", "type": "OEM"}, {"code": "YA 580039672", "type": "OEM"}]
+            }
+        ]
+
+@router.get("/{product_id}")
+async def get_product(
+    product_id: str = Path(...),
+    db: Session = Depends(get_db)
+):
+    """Obtém detalhes de um produto específico do banco real"""
+    try:
+        query = text("""
+            SELECT id, sku, title, description, brand, category, original_codes, image_urls
+            FROM products 
+            WHERE id = :product_id OR sku = :product_id
+            LIMIT 1
+        """)
+        
+        result = db.execute(query, {"product_id": product_id})
+        row = result.first()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail="Produto não encontrado")
+        
+        return {
+            "id": str(row.id),
+            "sku": row.sku,
+            "title": row.title,
+            "description": row.description,
+            "brand": {"name": row.brand} if row.brand else None,
+            "category": row.category,
+            "original_codes": row.original_codes,
+            "images": parse_image_urls(row.image_urls),
+            "codes": parse_original_codes(row.original_codes),
+            "applications": []
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erro ao buscar produto {product_id}: {e}")
+        raise HTTPException(status_code=500, detail="Erro interno")
+
+@router.get("/search")
+async def search_products_get(
+    q: str,
+    type: str = "texto",
+    skip: int = 0,
+    limit: int = 20,
+    db: Session = Depends(get_db)
+):
+    """Busca produtos no banco real usando GET"""
+    try:
+        if type == "codigo":
+            # Busca por código/SKU/original_codes
+            query = text("""
+                SELECT id, sku, title, description, brand, category, original_codes, image_urls
+                FROM products 
+                WHERE LOWER(sku) LIKE LOWER(:search_term)
+                   OR LOWER(original_codes) LIKE LOWER(:search_term)
+                ORDER BY 
+                    CASE 
+                        WHEN LOWER(sku) = LOWER(:exact_term) THEN 1 
+                        WHEN LOWER(original_codes) LIKE LOWER(:exact_match) THEN 2
+                        WHEN LOWER(sku) LIKE LOWER(:search_term) THEN 3
+                        ELSE 4 
+                    END,
+                    id
+                LIMIT :limit OFFSET :offset
+            """)
+            search_term = f"%{q}%"
+            exact_term = q
+            exact_match = f"% {q} %" # Para busca exata em original_codes
+            
+        else:  # texto ou imagem
+            # Busca por título, descrição, sku, original_codes
+            query = text("""
+                SELECT id, sku, title, description, brand, category, original_codes, image_urls
+                FROM products 
+                WHERE LOWER(title) LIKE LOWER(:search_term)
+                   OR LOWER(description) LIKE LOWER(:search_term)
+                   OR LOWER(sku) LIKE LOWER(:search_term)
+                   OR LOWER(brand) LIKE LOWER(:search_term)
+                   OR LOWER(original_codes) LIKE LOWER(:search_term)
+                ORDER BY 
+                    CASE 
+                        WHEN LOWER(title) LIKE LOWER(:exact_term) THEN 1
+                        WHEN LOWER(sku) = LOWER(:q) THEN 2
+                        WHEN LOWER(original_codes) LIKE LOWER(:exact_match) THEN 3
+                        WHEN LOWER(title) LIKE LOWER(:search_term) THEN 4
+                        ELSE 5 
+                    END,
+                    id
+                LIMIT :limit OFFSET :offset
+            """)
+            search_term = f"%{q}%"
+            exact_term = f"%{q}%"
+            exact_match = f"% {q} %"
+        
+        result = db.execute(query, {
+            "search_term": search_term, 
+            "exact_term": exact_term,
+            "exact_match": exact_match,
+            "q": q,
+            "limit": limit, 
+            "offset": skip
+        })
+        
+        products = []
+        for row in result:
+            product = {
+                "id": str(row.id),
+                "sku": row.sku,
+                "title": row.title,
+                "description": row.description,
+                "brand": {"name": row.brand} if row.brand else None,
+                "category": row.category,
+                "original_codes": row.original_codes,
+                "images": parse_image_urls(row.image_urls),
+                "codes": parse_original_codes(row.original_codes)
+            }
+            products.append(product)
+        
+        return {
+            "products": products,
+            "total": len(products),
+            "page": (skip // limit) + 1,
+            "limit": limit,
+            "hasMore": len(products) == limit
+        }
+        
+    except Exception as e:
+        print(f"Erro na busca: {e}")
+        return {
+            "products": [],
+            "total": 0,
+            "page": 1,
+            "limit": limit,
+            "hasMore": False
+        }

@@ -1,0 +1,73 @@
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-logparts}
+      POSTGRES_USER: ${POSTGRES_USER:-logparts}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-logparts123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-logparts} -d ${POSTGRES_DB:-logparts}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: development
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-logparts}:${POSTGRES_PASSWORD:-logparts123}@db:5432/${POSTGRES_DB:-logparts}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ENVIRONMENT: development
+      LOG_LEVEL: DEBUG
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api:/app
+      - ./uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: worker
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-logparts}:${POSTGRES_PASSWORD:-logparts123}@db:5432/${POSTGRES_DB:-logparts}
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ENVIRONMENT: development
+    volumes:
+      - ./api:/app
+      - ./uploads:/app/uploads
+    depends_on:
+      - redis
+      - db
+
+volumes:
+  postgres_data:
+  redis_data:

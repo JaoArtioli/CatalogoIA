@@ -1,0 +1,125 @@
+﻿version: '3.8'
+
+services:
+  db:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_DB: \
+      POSTGRES_USER: \
+      POSTGRES_PASSWORD: \
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - logparts_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \ -d \"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    networks:
+      - logparts_network
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: production
+    environment:
+      - DATABASE_URL=postgresql://\:\@db:5432/\
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=\
+      - JWT_SECRET_KEY=\
+      - ENVIRONMENT=production
+      - LOG_LEVEL=\
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - logparts_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+      target: production
+    environment:
+      - DATABASE_URL=postgresql://\:\@db:5432/\
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=\
+      - ENVIRONMENT=production
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      - redis
+      - db
+      - api
+    networks:
+      - logparts_network
+    restart: unless-stopped
+    command: celery -A app.workers.celery worker --loglevel=info --concurrency=2
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      target: production
+    environment:
+      - VITE_API_URL=/api
+      - VITE_APP_NAME=CatÃ¡logo Log Parts
+    networks:
+      - logparts_network
+    restart: unless-stopped
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./uploads:/usr/share/nginx/uploads:ro
+    depends_on:
+      - api
+      - web
+    networks:
+      - logparts_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  logparts_network:
+    driver: bridge
